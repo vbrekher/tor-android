@@ -1,0 +1,92 @@
+name: Issue 73 verification
+
+on:
+  push:
+    branches:
+      - fix/73-shutdown-status-order
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Set up JDK 24
+        uses: actions/setup-java@v4
+        with:
+          java-version: '24'
+          distribution: temurin
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf autogen automake autopoint autotools-dev gettext-base libtool make patch pkg-config
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'ndk;28.2.13676358'
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Build Tor native library for emulator
+        run: |
+          chmod +x gradlew tor-droid-make.sh
+          ./tor-droid-make.sh fetch -c
+          ./tor-droid-make.sh build -a x86_64
+          test -f external/lib/x86_64/libtor.so
+
+      - name: Verify shutdown status regression and fix
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          script: |
+            python .github/issue73_patch.py test
+            set +e
+            ./gradlew :tor-android-binary:connectedDebugAndroidTest \
+              -Pandroid.testInstrumentationRunnerArguments.class=org.torproject.jni.TorServiceTest#testShutdownStatusOrder \
+              | tee /tmp/issue73-before.log
+            status=${PIPESTATUS[0]}
+            set -e
+            if [ "$status" -eq 0 ]; then
+              echo 'Expected shutdown-order regression to fail before the fix'
+              exit 1
+            fi
+            if ! grep -R -q 'STOPPING must be broadcast before OFF' \
+              tor-android-binary/build/outputs/androidTest-results \
+              tor-android-binary/build/reports/androidTests 2>/dev/null; then
+              echo 'Pre-fix failure was not the expected shutdown-order assertion'
+              exit 1
+            fi
+
+            python .github/issue73_patch.py fix
+            ./gradlew :tor-android-binary:connectedDebugAndroidTest \
+              -Pandroid.testInstrumentationRunnerArguments.class=org.torproject.jni.TorServiceTest#testShutdownStatusOrder
+
+      - name: Compile and assemble
+        run: |
+          ./gradlew \
+            :tor-android-binary:compileDebugAndroidTestJavaWithJavac \
+            :tor-android-binary:assembleDebug
+
+      - name: Check diff
+        run: git diff --check
+
+      - name: Commit verified patch
+        run: |
+          git config user.name 'v ₿'
+          git config user.email 'valentin.brekher@gmail.com'
+          git add \
+            tor-android-binary/src/main/java/org/torproject/jni/TorService.java \
+            tor-android-binary/src/androidTest/java/org/torproject/jni/TorServiceTest.java
+          git commit -m 'fix TorService shutdown status order'
+          git push
